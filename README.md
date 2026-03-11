@@ -21,6 +21,22 @@ engine = DspatchEngine(agent_fn=my_agent)
 engine.run()
 ```
 
+## Releasing
+
+Releases are published to PyPI automatically when a version tag is pushed.
+
+```bash
+pip install bump-my-version
+
+# bump version (patch/minor/major), auto-commits and tags
+bump-my-version bump patch   # 0.1.0 → 0.1.1
+bump-my-version bump minor   # 0.1.0 → 0.2.0
+bump-my-version bump major   # 0.1.0 → 1.0.0
+
+# push commit + tag to trigger publish
+git push origin main --tags
+```
+
 ## Documentation
 
 See the full documentation at [dspatch.dev/docs](https://dspatch.dev/docs).
