@@ -56,6 +56,7 @@ class AgentWorker:
         self._running = True
         self._ctx = None
         self._current_turn_id: str | None = None
+        self._interrupted = False
 
     # ── Main loop ────────────────────────────────────────────────────────
 

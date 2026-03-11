@@ -106,6 +106,7 @@ class AgentHostRouter:
         self._instance_routers: dict[str, AgentInstanceRouter] = {}
         self._instance_sms: dict[str, StateManager] = {}
         self._instance_workers: dict[str, AgentWorker] = {}
+        self._instance_worker_tasks: dict[str, asyncio.Task] = {}
 
         # Install buffering log handler on the dspatch logger namespace.
         # propagate=False keeps records out of the root stderr handler so
@@ -223,6 +224,10 @@ class AgentHostRouter:
                 else:
                     logger.info("Terminating whole host")
                     self._running = False
+            elif event_type == "agent.signal.interrupt":
+                iid = event.get("instance_id")
+                if iid:
+                    await self._interrupt_instance(iid)
             elif event_type == "agent.signal.state_query":
                 request_id = event.get("request_id", "")
                 states = {iid: sm.current_state for iid, sm in self._instance_sms.items()}
@@ -318,6 +323,7 @@ class AgentHostRouter:
             self._instance_routers.pop(iid, None)
             self._instance_sms.pop(iid, None)
             self._instance_workers.pop(iid, None)
+            self._instance_worker_tasks.pop(iid, None)
 
         task.add_done_callback(_on_done)
 
@@ -338,6 +344,7 @@ class AgentHostRouter:
         worker_task = asyncio.create_task(
             worker.run(), name=f"worker-{instance_id}",
         )
+        self._instance_worker_tasks[instance_id] = worker_task
 
         def _log_worker_error(t: asyncio.Task, iid=instance_id):
             if not t.cancelled() and t.exception() is not None:
@@ -351,6 +358,14 @@ class AgentHostRouter:
                 except asyncio.TimeoutError:
                     continue
                 router.receive(event)
+
+                # If the worker was cancelled (e.g. by interrupt), restart it.
+                if worker_task.done():
+                    worker_task = asyncio.create_task(
+                        worker.run(), name=f"worker-{instance_id}",
+                    )
+                    self._instance_worker_tasks[instance_id] = worker_task
+                    worker_task.add_done_callback(_log_worker_error)
         except asyncio.CancelledError:
             raise
         finally:
@@ -361,7 +376,7 @@ class AgentHostRouter:
                 pass
 
     def _handle_instance_control(self, instance_id: str, event: dict) -> None:
-        """Handle instance-level control events (state_query, terminate, drain)."""
+        """Handle instance-level control events (state_query, terminate, drain, interrupt)."""
         event_type = event.get("type", "")
         if event_type == "agent.signal.state_query":
             request_id = event.get("request_id", "")
@@ -378,6 +393,8 @@ class AgentHostRouter:
             asyncio.create_task(self._kill_instance(instance_id))
         elif event_type == "agent.signal.drain":
             asyncio.create_task(self._drain_instance(instance_id))
+        elif event_type == "agent.signal.interrupt":
+            asyncio.create_task(self._interrupt_instance(instance_id))
 
     def _handle_instance_keepalive(self, instance_id: str, event: dict) -> None:
         """Handle keepalive events for an instance — forward to its Context."""
@@ -386,6 +403,49 @@ class AgentHostRouter:
             # request.alive carries request_id; inquiry.alive carries inquiry_id.
             alive_id = event.get("request_id") or event.get("inquiry_id", "")
             worker._ctx._record_request_alive(alive_id)
+
+    async def _interrupt_instance(self, instance_id: str) -> None:
+        """Interrupt current generation — cancel the worker, reset to idle, keep instance alive.
+
+        The worker task is cancelled (which aborts the running agent function),
+        state is reset to idle, and the _instance_event_loop will restart the
+        worker on its next iteration.
+        """
+        sm = self._instance_sms.get(instance_id)
+        router = self._instance_routers.get(instance_id)
+        worker = self._instance_workers.get(instance_id)
+        worker_task = self._instance_worker_tasks.get(instance_id)
+
+        if sm is None or router is None:
+            logger.warning("Interrupt: instance %s not found", instance_id)
+            return
+
+        if sm.current_state == "idle":
+            logger.debug("Interrupt: instance %s already idle", instance_id)
+            return
+
+        # 1. Cancel the worker task — this aborts the running agent function.
+        if worker_task is not None and not worker_task.done():
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+        # 2. Reset state: pop any active turns and force idle.
+        #    Use _set_state to bypass guards — interrupt can happen from any state.
+        while router.current_turn_id is not None:
+            router.pop_turn()
+        sm._pending_wait = None
+        sm._current_interrupt = None
+        sm._set_state("idle")
+
+        # 3. Reset the worker so it can be restarted by _instance_event_loop.
+        if worker is not None:
+            worker._running = True
+            worker._gen = None
+
+        logger.info("Instance interrupted: %s", instance_id)
 
     async def _drain_instance(self, instance_id: str) -> None:
         """Gracefully stop an instance — let it finish current turn, then cancel."""
@@ -401,6 +461,7 @@ class AgentHostRouter:
         self._instance_routers.pop(instance_id, None)
         self._instance_sms.pop(instance_id, None)
         self._instance_workers.pop(instance_id, None)
+        self._instance_worker_tasks.pop(instance_id, None)
 
         if task is not None:
             task.cancel()
@@ -424,6 +485,7 @@ class AgentHostRouter:
         self._instance_routers.clear()
         self._instance_sms.clear()
         self._instance_workers.clear()
+        self._instance_worker_tasks.clear()
 
     def _request_stop(self) -> None:
         logger.info("Shutdown requested.")

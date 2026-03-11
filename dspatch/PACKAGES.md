@@ -153,6 +153,7 @@ Package
 │   └── SignalPackage
 │       ├── DrainPackage               agent.signal.drain
 │       ├── TerminatePackage           agent.signal.terminate
+│       ├── InterruptPackage           agent.signal.interrupt
 │       ├── StateQueryPackage          agent.signal.state_query
 │       ├── StateReportPackage         agent.signal.state_report
 │       └── InstanceSpawnedPackage     agent.signal.instance_spawned
@@ -419,6 +420,16 @@ Hard stop: the instance task is cancelled immediately, without waiting for the c
 
 ---
 
+#### InterruptPackage — `agent.signal.interrupt` (Host Router → instance)
+
+Interrupts the current generation: the running agent function is cancelled, the instance transitions back to `idle`, and the instance remains alive and ready for new input. Unlike `drain` and `terminate`, the instance is not destroyed.
+
+Used to implement a "stop generating" action in the UI.
+
+*(No additional fields beyond `instance_id`.)*
+
+---
+
 #### StateQueryPackage — `agent.signal.state_query` (Host Router → instance)
 
 Request the instance to report its current state. Correlated by `instance_id` — no separate request ID is needed because only one outstanding query per instance is expected.
@@ -565,6 +576,7 @@ All valid `type` strings:
 | `agent.event.inquiry.failed` | InquiryFailedPackage |
 | `agent.signal.drain` | DrainPackage |
 | `agent.signal.terminate` | TerminatePackage |
+| `agent.signal.interrupt` | InterruptPackage |
 | `agent.signal.state_query` | StateQueryPackage |
 | `agent.signal.state_report` | StateReportPackage |
 | `agent.signal.instance_spawned` | InstanceSpawnedPackage |
@@ -758,6 +770,7 @@ The Agent Instance Router decides where to deliver each inbound package based on
 | `waiting_for_inquiry` | `agent.event.inquiry.request` (forwarded) | Interrupt: push wait, deliver inquiry |
 | Any | `agent.signal.drain` | Finish current turn then terminate |
 | Any | `agent.signal.terminate` | Cancel immediately |
+| Any | `agent.signal.interrupt` | Cancel current generation, return to idle (instance stays alive) |
 | Any | `agent.signal.state_query` | Reply with `agent.signal.state_report` |
 
 Packages that do not match any routing rule for the current state are dropped with a warning log.

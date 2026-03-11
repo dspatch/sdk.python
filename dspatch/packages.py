@@ -631,6 +631,21 @@ class TerminatePackage(SignalPackage):
 
 
 @dataclass
+class InterruptPackage(SignalPackage):
+    """Engine requests interruption of the current generation.
+
+    Unlike drain/terminate, the instance stays alive and transitions
+    back to idle — ready for new input. Used for "stop generating".
+    """
+
+    TYPE: ClassVar[str] = "agent.signal.interrupt"
+
+    @classmethod
+    def _from_dict(cls, data: dict[str, Any]) -> InterruptPackage:
+        return cls(instance_id=data.get("instance_id", ""))
+
+
+@dataclass
 class StateQueryPackage(SignalPackage):
     """Engine requests the current state of this agent instance.
 

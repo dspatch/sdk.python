@@ -23,7 +23,7 @@ from .state_manager import StateManager
 _RESPONSE_EVENTS = frozenset({"agent.event.talk_to.response", "agent.event.inquiry.response"})
 _INQUIRY_EVENTS = frozenset({"agent.event.inquiry.request"})
 _TERMINATION_EVENTS = frozenset({"agent.event.request.failed", "agent.event.inquiry.failed"})
-_CONTROL_EVENTS = frozenset({"agent.signal.state_query", "agent.signal.terminate", "agent.signal.drain"})
+_CONTROL_EVENTS = frozenset({"agent.signal.state_query", "agent.signal.terminate", "agent.signal.drain", "agent.signal.interrupt"})
 _KEEPALIVE_EVENTS = frozenset({"agent.event.request.alive", "agent.event.inquiry.alive"})
 
 
