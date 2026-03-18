@@ -261,17 +261,26 @@ class AgentHostRouter:
         Spawns a new long-lived instance that runs the unified event loop.
         The engine will detect the instance via heartbeat and then route
         messages to it.
+
+        If the event carries a ``history`` list (session resume), the
+        conversation context is replayed into the worker so the agent
+        has full context before processing new input.
         """
         instance_id = event.get("instance_id", "")
+        history = event.get("history") or []
 
-        logger.info("Opening conversation: instance %s", instance_id)
+        logger.info(
+            "Opening conversation: instance %s (history: %d messages)",
+            instance_id, len(history),
+        )
 
-        await self._spawn_instance(instance_id=instance_id)
+        await self._spawn_instance(instance_id=instance_id, history=history)
 
     async def _spawn_instance(
         self,
         *,
         instance_id: str,
+        history: list[dict] | None = None,
     ) -> None:
         queue: asyncio.Queue[dict] = asyncio.Queue()
         sm = StateManager()
@@ -287,6 +296,7 @@ class AgentHostRouter:
             state_manager=sm,
             host=self,
             context_class=self._context_class,
+            history=history or [],
         )
 
         # Wire proactive state reports: on every state change, send a

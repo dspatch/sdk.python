@@ -12,6 +12,7 @@ from collections.abc import AsyncGenerator, Callable
 
 from .dispatcher import InputItem, InquiryInterruptItem
 from .instance_router import AgentInstanceRouter
+from .models import Message
 from .state_manager import StateManager
 
 logger = logging.getLogger("dspatch.worker")
@@ -42,6 +43,7 @@ class AgentWorker:
         state_manager: StateManager,
         host: object,
         context_class=None,
+        history: list[dict] | None = None,
     ) -> None:
         from .contexts import Context
         self._agent_fn = agent_fn
@@ -57,16 +59,26 @@ class AgentWorker:
         self._ctx = None
         self._current_turn_id: str | None = None
         self._interrupted = False
+        self._history: list[dict] = history or []
 
     # ── Main loop ────────────────────────────────────────────────────────
 
     async def run(self) -> None:
         """Main worker loop — pops from feed, runs agent, repeats."""
+        # Build initial messages from history (session resume).
+        initial_messages = self._parse_history(self._history)
+
         self._ctx = self._context_class(
             host=self._host,
             runner=self,  # AgentWorker acts as the runner interface for Context
             instance_id=self._instance_id,
+            messages=initial_messages,
         )
+        if initial_messages:
+            logger.info(
+                "AgentWorker %s replayed %d history messages into context",
+                self._instance_id, len(initial_messages),
+            )
         logger.info("AgentWorker %s ready", self._instance_id)
         try:
             while self._running:
@@ -175,6 +187,30 @@ class AgentWorker:
         if result and not self._ctx._message_sent:
             await self._send_message(result)
         self._ctx._pending_inquiry_id = None
+
+    # ── History replay ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_history(history: list[dict]) -> list[Message]:
+        """Convert raw history dicts into Message objects.
+
+        Each dict is expected to carry ``id``, ``role``, and ``content``.
+        Malformed entries are skipped with a warning.  The resulting list
+        seeds ``Context.messages`` so the agent has full conversation
+        context before processing new input.  Because every Message
+        retains its original UUID7 ``id``, any output the agent produces
+        with the same id will be an upsert — no duplicates.
+        """
+        messages: list[Message] = []
+        for entry in history:
+            msg_id = entry.get("id", "")
+            role = entry.get("role", "")
+            content = entry.get("content", "")
+            if not msg_id or not role:
+                logger.warning("Skipping malformed history entry: %s", entry)
+                continue
+            messages.append(Message(id=msg_id, role=role, content=content))
+        return messages
 
     # ── Agent execution ──────────────────────────────────────────────────
 
