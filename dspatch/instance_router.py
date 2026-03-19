@@ -11,8 +11,11 @@ Owns:
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import Callable
+
+logger = logging.getLogger("dspatch.router")
 
 from .dispatcher import (
     FeedItem, InputItem, ResponseItem, InquiryInterruptItem, TerminationItem,
@@ -42,9 +45,11 @@ class AgentInstanceRouter:
     Tags outbound output packages and response event packages with turn_id.
     """
 
+    _MAX_BUFFER_SIZE = 5000
+
     def __init__(self, state_manager: StateManager) -> None:
         self._sm = state_manager
-        self.feed: asyncio.Queue[FeedItem] = asyncio.Queue()
+        self.feed: asyncio.Queue[FeedItem] = asyncio.Queue(maxsize=5000)
         self._buffer: list[FeedItem] = []
         self._turn_stack: list[str] = []
 
@@ -110,18 +115,18 @@ class AgentInstanceRouter:
 
         if state == "idle":
             if isinstance(item, (InputItem, InquiryInterruptItem)):
-                self.feed.put_nowait(item)
+                self._feed_put(item)
             else:
-                self._buffer_insert(item)
+                self._buffer_insert_capped(item)
 
         elif state == "generating":
-            self._buffer_insert(item)
+            self._buffer_insert_capped(item)
 
         elif state in ("waiting_for_agent", "waiting_for_inquiry"):
             if isinstance(item, (ResponseItem, TerminationItem, InquiryInterruptItem)):
-                self.feed.put_nowait(item)
+                self._feed_put(item)
             else:
-                self._buffer_insert(item)
+                self._buffer_insert_capped(item)
 
     # ── State change observer ────────────────────────────────────────────
 
@@ -151,12 +156,36 @@ class AgentInstanceRouter:
         else:
             self._buffer.append(item)
 
+    def _feed_put(self, item: FeedItem) -> None:
+        """Put an item on the feed queue, dropping it if full."""
+        try:
+            self.feed.put_nowait(item)
+        except asyncio.QueueFull:
+            logger.warning(
+                "Router feed full (%d), dropping item: %s",
+                self.feed.maxsize, type(item).__name__,
+            )
+
+    def _buffer_insert_capped(self, item: FeedItem) -> None:
+        """Insert into buffer, dropping oldest non-critical item if at capacity."""
+        if len(self._buffer) >= self._MAX_BUFFER_SIZE:
+            # Drop oldest non-ResponseItem/TerminationItem entry.
+            for i, existing in enumerate(self._buffer):
+                if isinstance(existing, InputItem):
+                    logger.warning("Router buffer full, dropping oldest InputItem")
+                    del self._buffer[i]
+                    break
+            else:
+                logger.warning("Router buffer full, dropping oldest item")
+                self._buffer.pop(0)
+        self._buffer_insert(item)
+
     def _flush(self) -> None:
         """Deliver all buffered items that are appropriate for the current state."""
         remaining = []
         for item in self._buffer:
             if self._should_deliver(item):
-                self.feed.put_nowait(item)
+                self._feed_put(item)
             else:
                 remaining.append(item)
         self._buffer = remaining

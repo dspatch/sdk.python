@@ -73,7 +73,7 @@ class WsClient:
 
         self._ws: websockets.WebSocketClientProtocol | None = None  # type: ignore[name-defined]
         self._connected = asyncio.Event()
-        self._receive_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._receive_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=10_000)
         self._receive_task: asyncio.Task | None = None
         self._outgoing_buffer: deque[str] = deque(maxlen=_BUFFER_MAX)
         self._register_event: dict | None = None
@@ -490,13 +490,28 @@ class WsClient:
                     raw = await self._ws.recv()
                     data = json.loads(raw)
                     if isinstance(data, dict):
-                        await self._receive_queue.put(data)
+                        try:
+                            self._receive_queue.put_nowait(data)
+                        except asyncio.QueueFull:
+                            # Drop oldest to make room for incoming event.
+                            try:
+                                self._receive_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                            logger.warning(
+                                "Receive queue full (%d), dropping oldest event",
+                                self._receive_queue.maxsize,
+                            )
+                            self._receive_queue.put_nowait(data)
                 except json.JSONDecodeError:
                     logger.warning("Non-JSON message received, skipping")
                 except websockets.exceptions.ConnectionClosed:
                     logger.info("Connection lost, reconnecting in background")
                     self._connected.clear()
                     self._start_background_reconnect()
+                    break
+                except Exception:
+                    logger.debug("Receive loop error", exc_info=True)
                     break
         except asyncio.CancelledError:
             pass

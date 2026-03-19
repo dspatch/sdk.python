@@ -43,11 +43,15 @@ class _DspatchLogHandler(logging.Handler):
         self._client: WsClient | None = None
         self._buffer: list[tuple[str, str]] = []
 
+    _MAX_BUFFER = 1000
+
     def emit(self, record: logging.LogRecord) -> None:
         try:
             level = _LEVEL_MAP.get(record.levelno, "info")
             message = self.format(record)
             if self._client is None:
+                if len(self._buffer) >= self._MAX_BUFFER:
+                    self._buffer.pop(0)
                 self._buffer.append((level, message))
             else:
                 try:
@@ -239,7 +243,13 @@ class AgentHostRouter:
                 })
             # ── Instance-level events → route to queue ───────────────────
             elif instance_id and instance_id in self._instance_dispatch:
-                self._instance_dispatch[instance_id].put_nowait(event)
+                try:
+                    self._instance_dispatch[instance_id].put_nowait(event)
+                except asyncio.QueueFull:
+                    logger.warning(
+                        "Instance queue full for %s, dropping event %s",
+                        instance_id, event_type,
+                    )
 
             # Events without instance_id → route to first available instance.
             elif not instance_id and self._instance_dispatch:
@@ -248,7 +258,13 @@ class AgentHostRouter:
                     "Routing %s to instance %s (no instance_id)",
                     event_type, first_id,
                 )
-                self._instance_dispatch[first_id].put_nowait(event)
+                try:
+                    self._instance_dispatch[first_id].put_nowait(event)
+                except asyncio.QueueFull:
+                    logger.warning(
+                        "Instance queue full for %s, dropping event %s",
+                        first_id, event_type,
+                    )
 
             else:
                 logger.warning(
@@ -282,7 +298,7 @@ class AgentHostRouter:
         instance_id: str,
         history: list[dict] | None = None,
     ) -> None:
-        queue: asyncio.Queue[dict] = asyncio.Queue()
+        queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=1000)
         sm = StateManager()
         router = AgentInstanceRouter(state_manager=sm)
         router.on_control = lambda e: self._handle_instance_control(instance_id, e)
