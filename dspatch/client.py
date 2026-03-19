@@ -18,6 +18,14 @@ logger = logging.getLogger("dspatch.client")
 _RECONNECT_BASE = 2
 _RECONNECT_MAX = 30
 _BUFFER_MAX = 5000
+
+
+class AuthenticationError(Exception):
+    """Raised when the server permanently rejects our credentials (401/403).
+
+    Unlike transient connection errors this is not retried automatically —
+    the caller must handle it and either fix the key or abort.
+    """
 _CRITICAL_TYPES = frozenset({
     "agent.event.inquiry.request", "agent.event.talk_to.request",
     "agent.event.talk_to.response", "connection.register",
@@ -97,9 +105,20 @@ class WsClient:
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
-    async def connect(self) -> None:
-        """Connect to the WebSocket server and authenticate."""
+    async def connect(self, max_retries: int | None = None) -> None:
+        """Connect to the WebSocket server and authenticate.
+
+        Parameters
+        ----------
+        max_retries:
+            Maximum number of connection attempts before giving up.
+            ``None`` (default) means retry forever.  When the limit is
+            reached, the last exception is re-raised.
+            Note: ``AuthenticationError`` (401/403) is *never* retried
+            regardless of this setting.
+        """
         backoff = _RECONNECT_BASE
+        attempts = 0
 
         while True:
             try:
@@ -127,13 +146,28 @@ class WsClient:
                     # Start receive loop.
                     self._receive_task = asyncio.create_task(self._receive_loop())
                     return
-                else:
-                    msg = resp.get("message", "Unknown auth error")
-                    raise RuntimeError(f"Auth failed: {msg}")
+
+                # Distinguish permanent auth rejection from transient errors.
+                msg = resp.get("message", "Unknown auth error")
+                resp_type = resp.get("type", "")
+                if resp_type in ("connection.auth_error", "connection.auth_denied"):
+                    raise AuthenticationError(
+                        f"Authentication permanently rejected: {msg}"
+                    )
+                raise RuntimeError(f"Auth failed: {msg}")
 
             except asyncio.CancelledError:
                 raise
+            except AuthenticationError:
+                # Permanent — never retry.
+                raise
             except Exception as exc:
+                attempts += 1
+                if max_retries is not None and attempts >= max_retries:
+                    logger.error(
+                        "Connection failed after %d attempt(s): %s", attempts, exc,
+                    )
+                    raise
                 logger.debug(
                     "Connection failed (%s), retrying in %ds...",
                     exc, backoff,
@@ -452,6 +486,11 @@ class WsClient:
 
                 if resp.get("type") != "connection.auth_ack":
                     msg = resp.get("message", "Unknown auth error")
+                    resp_type = resp.get("type", "")
+                    if resp_type in ("connection.auth_error", "connection.auth_denied"):
+                        raise AuthenticationError(
+                            f"Authentication permanently rejected: {msg}"
+                        )
                     raise RuntimeError(f"Auth failed: {msg}")
 
                 self._connected.set()
@@ -473,6 +512,10 @@ class WsClient:
                 return
 
             except asyncio.CancelledError:
+                raise
+            except AuthenticationError:
+                # Permanent auth failure — stop reconnecting.
+                logger.error("Reconnect aborted: permanent authentication failure")
                 raise
             except Exception as exc:
                 logger.debug(

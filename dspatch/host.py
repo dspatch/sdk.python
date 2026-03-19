@@ -20,6 +20,8 @@ from .state_manager import StateManager
 logger = logging.getLogger("dspatch.host")
 
 _HEARTBEAT_INTERVAL = 5  # seconds
+_WORKER_CRASH_WINDOW = 60  # seconds: rolling window for crash rate tracking
+_WORKER_CRASH_LIMIT = 5    # max crashes within the window before stopping
 
 _LEVEL_MAP: dict[int, str] = {
     logging.DEBUG: "debug",
@@ -367,10 +369,15 @@ class AgentHostRouter:
         worker: AgentWorker,
     ) -> None:
         """Feed raw queue events into the AgentInstanceRouter, run worker in parallel."""
+        import time as _time
+
         worker_task = asyncio.create_task(
             worker.run(), name=f"worker-{instance_id}",
         )
         self._instance_worker_tasks[instance_id] = worker_task
+
+        # Crash rate tracking: timestamps of recent non-cancel crashes.
+        crash_timestamps: list[float] = []
 
         def _log_worker_error(t: asyncio.Task, iid=instance_id):
             if not t.cancelled() and t.exception() is not None:
@@ -385,8 +392,24 @@ class AgentHostRouter:
                     continue
                 router.receive(event)
 
-                # If the worker was cancelled (e.g. by interrupt), restart it.
+                # If the worker finished (cancelled by interrupt or crashed), restart it.
                 if worker_task.done():
+                    crashed = not worker_task.cancelled() and worker_task.exception() is not None
+                    if crashed:
+                        now = _time.monotonic()
+                        # Prune timestamps outside the rolling window.
+                        crash_timestamps = [
+                            t for t in crash_timestamps
+                            if now - t < _WORKER_CRASH_WINDOW
+                        ]
+                        crash_timestamps.append(now)
+                        if len(crash_timestamps) >= _WORKER_CRASH_LIMIT:
+                            logger.error(
+                                "Worker %s crashed %d times in %ds — stopping instance",
+                                instance_id, len(crash_timestamps), _WORKER_CRASH_WINDOW,
+                            )
+                            return
+
                     worker_task = asyncio.create_task(
                         worker.run(), name=f"worker-{instance_id}",
                     )
