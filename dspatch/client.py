@@ -32,6 +32,17 @@ _CRITICAL_TYPES = frozenset({
 })
 
 
+def _task_done_callback(task: asyncio.Task) -> None:
+    """Log any unhandled exception from a fire-and-forget task."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.error(
+            "Background task %s failed: %s", task.get_name(), exc, exc_info=exc,
+        )
+
+
 class WsClient:
     """WebSocket client for v2 workspace communication.
 
@@ -144,7 +155,10 @@ class WsClient:
                     logger.info("Connected and authenticated: %s", self._ws_url)
 
                     # Start receive loop.
-                    self._receive_task = asyncio.create_task(self._receive_loop())
+                    self._receive_task = asyncio.create_task(
+                        self._receive_loop(), name="ws-receive",
+                    )
+                    self._receive_task.add_done_callback(_task_done_callback)
                     return
 
                 # Distinguish permanent auth rejection from transient errors.
@@ -199,7 +213,7 @@ class WsClient:
             try:
                 await self._ws.close()
             except Exception:
-                pass
+                logger.debug("WebSocket close error during disconnect", exc_info=True)
             self._ws = None
 
         logger.info("Disconnected")
@@ -289,7 +303,7 @@ class WsClient:
         try:
             await self._ws.send(json.dumps(event))
         except Exception:
-            pass
+            logger.debug("Heartbeat send failed", exc_info=True)
 
     async def send_register(
         self, name: str, role: str = "", capabilities: list[str] | None = None,
@@ -452,7 +466,10 @@ class WsClient:
         """Kick off a background reconnect task if one is not already running."""
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return
-        self._reconnect_task = asyncio.create_task(self._background_reconnect())
+        self._reconnect_task = asyncio.create_task(
+            self._background_reconnect(), name="ws-reconnect",
+        )
+        self._reconnect_task.add_done_callback(_task_done_callback)
 
     async def _background_reconnect(self) -> None:
         """Reconnect with exponential backoff, re-auth, replay buffer."""
@@ -461,7 +478,7 @@ class WsClient:
             try:
                 await self._ws.close()
             except Exception:
-                pass
+                logger.debug("WebSocket close error during reconnect cleanup", exc_info=True)
             self._ws = None
 
         backoff = _RECONNECT_BASE
@@ -508,7 +525,10 @@ class WsClient:
                     self._outgoing_buffer.popleft()
 
                 # Restart receive loop.
-                self._receive_task = asyncio.create_task(self._receive_loop())
+                self._receive_task = asyncio.create_task(
+                    self._receive_loop(), name="ws-receive",
+                )
+                self._receive_task.add_done_callback(_task_done_callback)
                 return
 
             except asyncio.CancelledError:

@@ -19,6 +19,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger("dspatch.context")
 
 
+def _task_done_callback(task: asyncio.Task) -> None:
+    """Log any unhandled exception from a fire-and-forget task."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.error(
+            "Background task %s failed: %s", task.get_name(), exc, exc_info=exc,
+        )
+
+
 @dataclass
 class ToolSpec:
     """Canonical definition of a dspatch platform tool.
@@ -380,13 +391,17 @@ class Context:
         # Fire-and-forget: schedule the coroutine on the running loop.
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._runner._send_event({
-                "type": "agent.output.log",
-                "level": level,
-                "message": message,
-            }))
+            t = loop.create_task(
+                self._runner._send_event({
+                    "type": "agent.output.log",
+                    "level": level,
+                    "message": message,
+                }),
+                name="ctx-log-send",
+            )
+            t.add_done_callback(_task_done_callback)
         except RuntimeError:
-            pass  # No event loop — drop silently.
+            logger.debug("log() called with no running event loop, dropping entry")
 
     async def activity(
         self,

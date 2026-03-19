@@ -20,6 +20,17 @@ from .state_manager import StateManager
 logger = logging.getLogger("dspatch.host")
 
 _HEARTBEAT_INTERVAL = 5  # seconds
+
+
+def _task_done_callback(task: asyncio.Task) -> None:
+    """Log any unhandled exception from a fire-and-forget task."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.error(
+            "Background task %s failed: %s", task.get_name(), exc, exc_info=exc,
+        )
 _WORKER_CRASH_WINDOW = 60  # seconds: rolling window for crash rate tracking
 _WORKER_CRASH_LIMIT = 5    # max crashes within the window before stopping
 
@@ -58,9 +69,15 @@ class _DspatchLogHandler(logging.Handler):
             else:
                 try:
                     loop = asyncio.get_running_loop()
-                    loop.create_task(self._client.send_log(level, message))
+                    t = loop.create_task(
+                        self._client.send_log(level, message),
+                        name="log-forward",
+                    )
+                    t.add_done_callback(_task_done_callback)
                 except RuntimeError:
                     # No running loop — keep buffering.
+                    if len(self._buffer) >= self._MAX_BUFFER:
+                        self._buffer.pop(0)
                     self._buffer.append((level, message))
         except Exception:
             self.handleError(record)
@@ -165,7 +182,10 @@ class AgentHostRouter:
             await self._log_handler.attach(self._client)
 
             # 4. Start heartbeat.
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            self._heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(), name="heartbeat",
+            )
+            self._heartbeat_task.add_done_callback(_task_done_callback)
             logger.info("Heartbeat started (interval: %ds)", _HEARTBEAT_INTERVAL)
 
             # 5. Event loop.
@@ -326,11 +346,15 @@ class AgentHostRouter:
         def _proactive_state_report(old_state: str, new_state: str) -> None:
             if _router_state_cb is not None:
                 _router_state_cb(old_state, new_state)
-            asyncio.create_task(self._client.send_event({
-                "type": "agent.signal.state_report",
-                "instance_id": instance_id,
-                "state": new_state,
-            }))
+            t = asyncio.create_task(
+                self._client.send_event({
+                    "type": "agent.signal.state_report",
+                    "instance_id": instance_id,
+                    "state": new_state,
+                }),
+                name=f"state-report-{instance_id}",
+            )
+            t.add_done_callback(_task_done_callback)
 
         sm.on_state_changed = _proactive_state_report
 
@@ -431,19 +455,32 @@ class AgentHostRouter:
             request_id = event.get("request_id", "")
             sm = self._instance_sms.get(instance_id)
             state = sm.current_state if sm else "idle"
-            asyncio.create_task(self._client.send_event({
-                "type": "agent.signal.state_report",
-                "instance_id": instance_id,
-                "request_id": request_id,
-                "state": state,
-                "instances": {instance_id: state},
-            }))
+            t = asyncio.create_task(
+                self._client.send_event({
+                    "type": "agent.signal.state_report",
+                    "instance_id": instance_id,
+                    "request_id": request_id,
+                    "state": state,
+                    "instances": {instance_id: state},
+                }),
+                name=f"state-query-report-{instance_id}",
+            )
+            t.add_done_callback(_task_done_callback)
         elif event_type == "agent.signal.terminate":
-            asyncio.create_task(self._kill_instance(instance_id))
+            t = asyncio.create_task(
+                self._kill_instance(instance_id), name=f"kill-{instance_id}",
+            )
+            t.add_done_callback(_task_done_callback)
         elif event_type == "agent.signal.drain":
-            asyncio.create_task(self._drain_instance(instance_id))
+            t = asyncio.create_task(
+                self._drain_instance(instance_id), name=f"drain-{instance_id}",
+            )
+            t.add_done_callback(_task_done_callback)
         elif event_type == "agent.signal.interrupt":
-            asyncio.create_task(self._interrupt_instance(instance_id))
+            t = asyncio.create_task(
+                self._interrupt_instance(instance_id), name=f"interrupt-{instance_id}",
+            )
+            t.add_done_callback(_task_done_callback)
 
     def _handle_instance_keepalive(self, instance_id: str, event: dict) -> None:
         """Handle keepalive events for an instance — forward to its Context."""

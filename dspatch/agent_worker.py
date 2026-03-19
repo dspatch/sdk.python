@@ -18,6 +18,17 @@ from .state_manager import StateManager
 logger = logging.getLogger("dspatch.worker")
 
 
+def _task_done_callback(task: asyncio.Task) -> None:
+    """Log any unhandled exception from a fire-and-forget task."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.error(
+            "Background task %s failed: %s", task.get_name(), exc, exc_info=exc,
+        )
+
+
 def _with_sender_header(content: str, sender: str) -> str:
     """Prepend a sender header to prompt content."""
     return f"{{{{SENDER: {sender}}}}}\n{content}"
@@ -126,7 +137,7 @@ class AgentWorker:
                 self._router.pop_turn()
                 self._sm.enter_idle()
             except Exception:
-                pass
+                logger.debug("State cleanup error after worker exception", exc_info=True)
 
     async def _handle_input(self, item: InputItem) -> None:
         event = item.event
@@ -253,7 +264,7 @@ class AgentWorker:
             try:
                 await gen.aclose()
             except Exception:
-                pass
+                logger.debug("Generator close error", exc_info=True)
 
     # ── Send helpers (Context uses these via runner interface) ───────────
 
