@@ -200,7 +200,7 @@ class TestHeartbeatWithInstances:
         await client.send_heartbeat(states)
 
         sent = json.loads(client._ws.sent[-1])
-        assert sent["type"] == "heartbeat"
+        assert sent["type"] == "connection.heartbeat"
         assert sent["instances"]["inst_001"] == "generating"
         assert sent["instances"]["inst_002"] == "waiting_for_agent"
 
@@ -213,7 +213,7 @@ class TestHeartbeatWithInstances:
         await client.send_heartbeat(states)
 
         sent = json.loads(client._ws.sent[-1])
-        assert sent["type"] == "heartbeat"
+        assert sent["type"] == "connection.heartbeat"
         assert sent["instances"] == {}
 
 

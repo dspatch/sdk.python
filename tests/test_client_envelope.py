@@ -50,13 +50,13 @@ class TestEventEnvelopeInjection:
 
     @pytest.mark.asyncio
     async def test_no_injection_for_auth_type(self, connected_client: WsClient) -> None:
-        await connected_client.send_event({"type": "auth", "api_key": "key"})
+        await connected_client.send_event({"type": "connection.auth", "api_key": "key"})
         sent = json.loads(connected_client._ws.sent[-1])
         assert "instance_id" not in sent
 
     @pytest.mark.asyncio
     async def test_no_injection_for_heartbeat_type(self, connected_client: WsClient) -> None:
-        await connected_client.send_event({"type": "heartbeat"})
+        await connected_client.send_event({"type": "connection.heartbeat"})
         sent = json.loads(connected_client._ws.sent[-1])
         assert "instance_id" not in sent
 
@@ -86,14 +86,14 @@ class TestHeartbeatFormat:
     async def test_heartbeat_sends_instance_map(self, connected_client: WsClient) -> None:
         await connected_client.send_heartbeat({"inst_001": "running", "inst_002": "completed"})
         sent = json.loads(connected_client._ws.sent[-1])
-        assert sent["type"] == "heartbeat"
+        assert sent["type"] == "connection.heartbeat"
         assert sent["instances"] == {"inst_001": "running", "inst_002": "completed"}
 
     @pytest.mark.asyncio
     async def test_heartbeat_without_instances(self, connected_client: WsClient) -> None:
         await connected_client.send_heartbeat()
         sent = json.loads(connected_client._ws.sent[-1])
-        assert sent["type"] == "heartbeat"
+        assert sent["type"] == "connection.heartbeat"
         assert "instances" not in sent
 
     @pytest.mark.asyncio

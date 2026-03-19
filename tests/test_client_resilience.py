@@ -77,7 +77,7 @@ class TestBufferOverflow:
         await client.send_event({"type": "agent.event.inquiry.request", "content_markdown": "test"})
         assert len(client._outgoing_buffer) == _BUFFER_MAX
         last = json.loads(client._outgoing_buffer[-1])
-        assert last["type"] == "inquiry_request"
+        assert last["type"] == "agent.event.inquiry.request"
 
 
 class TestRegisterReplay:
@@ -86,7 +86,7 @@ class TestRegisterReplay:
     async def test_register_event_saved(self, client: WsClient) -> None:
         await client.send_register(name="test-agent", role="host")
         assert client._register_event is not None
-        assert client._register_event["type"] == "register"
+        assert client._register_event["type"] == "connection.register"
         assert client._register_event["name"] == "test-agent"
         assert client._register_event["role"] == "host"
         assert len(client._outgoing_buffer) == 1
