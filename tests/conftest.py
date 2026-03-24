@@ -9,9 +9,9 @@ import pytest
 @pytest.fixture(autouse=True)
 def _set_env(monkeypatch):
     """Provide default env vars for all tests."""
-    monkeypatch.setenv("DSPATCH_API_URL", "http://localhost:9999")
-    monkeypatch.setenv("DSPATCH_API_KEY", "test-key-123")
+    monkeypatch.setenv("DSPATCH_GRPC_SOCKET", "/tmp/test-dspatch.sock")
+    monkeypatch.setenv("DSPATCH_AGENT_KEY", "test-agent")
+    monkeypatch.setenv("DSPATCH_AGENT_INSTANCE", "0")
     monkeypatch.setenv("DSPATCH_SESSION_ID", "test-session-456")
     monkeypatch.setenv("DSPATCH_WORKSPACE_ID", "test-workspace-456")
-    monkeypatch.setenv("DSPATCH_RUN_ID", "test-run-789")
-    monkeypatch.setenv("DSPATCH_AGENT_ID", "test-agent")
+    monkeypatch.setenv("DSPATCH_WORKSPACE_DIR", "/workspace")

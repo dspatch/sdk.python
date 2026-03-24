@@ -558,6 +558,8 @@ class Context:
                     return response.success.response_text
                 return InquiryResponse(
                     text=response.success.response_text,
+                    # TODO: Proto3 scalar int defaults to 0, so index 0 is indistinguishable
+                    # from "no selection". Consider using a wrapper type or sentinel value.
                     suggestion_index=response.success.suggestion_index if response.success.suggestion_index != 0 else None,
                 )
 

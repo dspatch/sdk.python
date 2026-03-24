@@ -74,11 +74,6 @@ async def execute(
             text,
             continue_conversation=continue_conv,
         )
-        # Check if this is an interrupt message.
-        if isinstance(response, str) and response.startswith("INTERRUPTED:"):
-            return {
-                "content": [{"type": "text", "text": response}],
-            }
         return {
             "content": [{"type": "text", "text": response}],
         }
