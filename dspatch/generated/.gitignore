@@ -1,0 +1,3 @@
+# Generated files are checked in for SDK distribution.
+# Regenerate with: bash scripts/gen_proto.sh
+# Do NOT add patterns here — all generated files should be committed.
