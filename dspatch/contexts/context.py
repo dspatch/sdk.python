@@ -10,11 +10,11 @@ import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, TYPE_CHECKING, Literal
 
-from ..dispatcher import FeedItem, InquiryInterruptItem
 from ..models import InquiryResponse, Message
+from ..generated import dspatch_router_pb2
 
 if TYPE_CHECKING:
-    from ..agent_worker import AgentWorker  # noqa: F401
+    from ..grpc_channel import GrpcChannel
 
 logger = logging.getLogger("dspatch.context")
 
@@ -62,9 +62,6 @@ def _uuid7_hex() -> str:
     uuid_int |= rand_b
     return f"{uuid_int:032x}"
 
-
-_CHAIN_ALIVE_TIMEOUT = 90  # 3x the 30s app heartbeat interval
-_CHAIN_WATCHDOG_CHECK = 15  # check frequency in seconds
 
 _INQUIRY_INSTRUCTIONS = """\
 ## Inquiries
@@ -120,22 +117,22 @@ Do NOT escalate trivial decisions you can make on your own \
 class Context:
     """Agent context for workspace-based agents.
 
-    All event methods send immediately through the host connection.
-    Every outgoing event is tagged with ``instance_id`` and ``turn_id``
-    by the ``AgentWorker._send_event()`` helper.
+    All event methods send immediately through gRPC to the container-local
+    dspatch-router. Every outgoing event is tagged with ``instance_id``.
     """
 
     def __init__(
         self,
-        host: object,
-        runner: object,
-        messages: list[Message] | None = None,
-        instance_id: str | None = None,
+        channel: GrpcChannel,
+        instance_id: str,
+        turn_id: str,
+        messages: list[Message],
     ) -> None:
-        self._host = host
-        self._runner = runner
+        self._channel = channel
+        self._instance_id = instance_id
+        self._turn_id = turn_id
         self._message_sent = False
-        self.messages: list[Message] = messages or []
+        self.messages: list[Message] = messages
 
         self._pending_inquiry_id: str | None = None
 
@@ -153,13 +150,6 @@ class Context:
 
         # Workspace directory (project root inside the container).
         self.workspace_dir: str = os.environ.get("DSPATCH_WORKSPACE_DIR", "/workspace")
-
-        # Instance identity.
-        self._instance_id: str | None = instance_id
-
-        # Chain liveness tracking for talk_to requests.
-        self._talk_to_chain_dead: dict[str, asyncio.Event] = {}
-        self._request_alive_timestamps: dict[str, float] = {}
 
         # Maps peer_name -> last conversation_id (for continue_conversation).
         self._peer_conversations: dict[str, str] = {}
@@ -366,14 +356,8 @@ class Context:
 
     @property
     def turn_id(self) -> str | None:
-        """Current turn_id, delegated through runner._router.current_turn_id.
-
-        Returns None if the runner has no _router or the stack is empty.
-        """
-        router = getattr(self._runner, '_router', None)
-        if router is not None:
-            return getattr(router, 'current_turn_id', None)
-        return None
+        """Current turn_id, stored directly from constructor."""
+        return self._turn_id
 
     # ── Immediate event methods ──────────────────────────────────────────
 
@@ -381,22 +365,46 @@ class Context:
 
     _VALID_LOG_LEVELS = {"debug", "info", "warn", "error"}
 
+    async def message(
+        self,
+        content: str,
+        is_delta: bool = False,
+        id: str | None = None,
+        role: str = "assistant",
+    ) -> None:
+        """Send a message via gRPC SendOutput."""
+        self._message_sent = True
+        await self._channel.stub.SendOutput(
+            dspatch_router_pb2.OutputEvent(
+                instance_id=self._instance_id,
+                message=dspatch_router_pb2.MessageOutput(
+                    id=id or _uuid7_hex(),
+                    role=role,
+                    content=content,
+                    is_delta=is_delta,
+                ),
+            )
+        )
+
     def log(self, message: str, level: LogLevel = "info") -> None:
-        """Send a log entry immediately."""
+        """Send a log entry immediately (fire-and-forget)."""
         if level not in self._VALID_LOG_LEVELS:
             raise ValueError(
                 f"Invalid log level {level!r}, "
                 f"must be one of {sorted(self._VALID_LOG_LEVELS)}"
             )
-        # Fire-and-forget: schedule the coroutine on the running loop.
         try:
             loop = asyncio.get_running_loop()
             t = loop.create_task(
-                self._runner._send_event({
-                    "type": "agent.output.log",
-                    "level": level,
-                    "message": message,
-                }),
+                self._channel.stub.SendOutput(
+                    dspatch_router_pb2.OutputEvent(
+                        instance_id=self._instance_id,
+                        log=dspatch_router_pb2.LogOutput(
+                            level=level,
+                            message=message,
+                        ),
+                    )
+                ),
                 name="ctx-log-send",
             )
             t.add_done_callback(_task_done_callback)
@@ -411,28 +419,22 @@ class Context:
         id: str | None = None,
         data: dict | None = None,
     ) -> str:
-        """Record an activity event. Returns the activity id.
-
-        Args:
-            event_type: Categorises the activity (e.g. ``"tool_call"``,
-                ``"thinking"``).
-            content: Optional text content.  When ``is_delta=True``,
-                appended to the existing row; when ``False``, replaces it.
-                ``None`` leaves the DB column untouched.
-            is_delta: If ``True``, non-None fields are *appended* to the
-                existing activity with the same ``id``.
-            id: Identifies the exact activity row.  When ``None`` a new
-                UUID7 is generated automatically.
-            data: Optional structured metadata dict.  Follows the same
-                delta/replace semantics as ``content``.
-        """
-        return await self._runner._send_activity(
-            event_type,
-            content=content,
-            is_delta=is_delta,
-            activity_id=id,
-            data=data,
+        """Record an activity event via gRPC SendOutput. Returns the activity id."""
+        import json
+        aid = id or _uuid7_hex()
+        await self._channel.stub.SendOutput(
+            dspatch_router_pb2.OutputEvent(
+                instance_id=self._instance_id,
+                activity=dspatch_router_pb2.ActivityOutput(
+                    id=aid,
+                    event_type=event_type,
+                    content=content or "",
+                    is_delta=is_delta,
+                    data=json.dumps(data) if data else "",
+                ),
+            )
         )
+        return aid
 
     async def usage(
         self,
@@ -442,24 +444,34 @@ class Context:
         cost_usd: float = 0.0,
         **kwargs: object,
     ) -> None:
-        """Record token usage for an LLM call. Sends immediately."""
-        await self._runner._send_event({
-            "type": "agent.output.usage",
-            "model": model,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cost_usd": cost_usd,
-            **kwargs,
-        })
+        """Record token usage for an LLM call via gRPC SendOutput."""
+        await self._channel.stub.SendOutput(
+            dspatch_router_pb2.OutputEvent(
+                instance_id=self._instance_id,
+                usage=dspatch_router_pb2.UsageOutput(
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost_usd=cost_usd,
+                ),
+            )
+        )
 
     async def files(self, file_list: list[dict]) -> None:
-        """Record file operations. Sends immediately."""
-        await self._runner._send_event({
-            "type": "agent.output.files",
-            "files": file_list,
-        })
-
-    # ── Direct (blocking) ────────────────────────────────────────────────
+        """Record file operations via gRPC SendOutput."""
+        entries = [
+            dspatch_router_pb2.FileEntry(
+                path=f.get("path", ""),
+                action=f.get("action", ""),
+            )
+            for f in file_list
+        ]
+        await self._channel.stub.SendOutput(
+            dspatch_router_pb2.OutputEvent(
+                instance_id=self._instance_id,
+                files=dspatch_router_pb2.FilesOutput(files=entries),
+            )
+        )
 
     async def prompt(
         self,
@@ -467,38 +479,60 @@ class Context:
         *,
         sender_name: str | None = None,
     ) -> None:
-        """Record an incoming prompt received by this agent.
-
-        Use this to log prompts the agent receives (from users, other agents,
-        or injected inquiries) separately from the agent's own output messages.
-        Sends an ``agent.output.prompt_received`` package.
-        """
-        await self._runner._send_prompt_received(content, sender_name=sender_name)
-
-    async def message(
-        self,
-        content: str,
-        is_delta: bool = False,
-        id: str | None = None,
-        role: str = "assistant",
-        **kwargs: object,
-    ) -> str:
-        """Send a message immediately. Returns the message id.
-
-        Args:
-            content: The message text.
-            is_delta: If ``True``, *append* content to the existing message
-                with the same ``id`` in the database.  If ``False`` (default),
-                *replace* the stored content (or create a new row).
-            id: Identifies the exact message.  When ``None`` a new UUID7 is
-                generated automatically.
-            role: Message role (``"assistant"``, ``"user"``, ``"tool"``).
-        """
-        self._message_sent = True
-        return await self._runner._send_message(
-            content, role=role, message_id=id,
-            is_delta=is_delta, **kwargs,
+        """Record an incoming prompt received by this agent via gRPC SendOutput."""
+        await self._channel.stub.SendOutput(
+            dspatch_router_pb2.OutputEvent(
+                instance_id=self._instance_id,
+                prompt_received=dspatch_router_pb2.PromptReceivedOutput(
+                    content=content,
+                    sender_name=sender_name or "",
+                ),
+            )
         )
+
+    # ── Blocking RPC methods ─────────────────────────────────────────────
+
+    async def talk_to(
+        self,
+        target_agent: str,
+        text: str,
+        *,
+        continue_conversation: bool = False,
+    ) -> str:
+        """Talk to another agent. Single blocking gRPC call with interrupt loop.
+
+        Returns the target agent's response text.
+        """
+        response = await self._channel.stub.TalkTo(
+            dspatch_router_pb2.TalkToRpcRequest(
+                instance_id=self._instance_id,
+                target_agent=target_agent,
+                text=text,
+                continue_conversation=continue_conversation,
+            )
+        )
+
+        while True:
+            which = response.WhichOneof("result")
+
+            if which == "success":
+                conv_id = response.success.conversation_id
+                if conv_id:
+                    self._peer_conversations[target_agent] = conv_id
+                return response.success.response
+
+            elif which == "error":
+                raise RuntimeError(response.error.reason)
+
+            elif which == "interrupt":
+                reply = await self._handle_inquiry_interrupt(response.interrupt)
+                response = await self._channel.stub.ResumeTalkTo(
+                    dspatch_router_pb2.ResumeTalkToRequest(
+                        instance_id=self._instance_id,
+                        request_id=response.interrupt.inquiry_id,
+                        inquiry_response_text=reply,
+                    )
+                )
 
     async def inquire(
         self,
@@ -506,14 +540,12 @@ class Context:
         suggestions: list[str | dict] | None = None,
         file_paths: list[str] | None = None,
         priority: str = "normal",
-        timeout_hours: float = 72,
+        timeout_hours: float | None = None,
     ) -> InquiryResponse | str:
         """Post an inquiry and block until the user responds or an interrupt arrives.
 
-        Returns InquiryResponse on success, or an interrupt message string.
+        Single blocking gRPC call with interrupt loop.
         """
-        from ..dispatcher import ResponseItem, InquiryInterruptItem, TerminationItem
-
         # Wire protocol: suggestions is list[string].
         suggestion_strings: list[str] | None = None
         if suggestions is not None:
@@ -528,254 +560,49 @@ class Context:
                 else:
                     suggestion_strings.append(str(s))
 
-        inquiry_id = _uuid7_hex()
-        self._pending_inquiry_id = inquiry_id
-
-        # Emit a dedicated inquiry.request activity so the app can render
-        # the inquiry card inline in the timeline.
-        await self.activity(
-            "inquiry.request",
-            data={
-                "inquiry_id": inquiry_id,
-                "priority": priority,
-            },
-        )
-
-        event: dict = {
-            "type": "agent.event.inquiry.request",
-            "content_markdown": content_markdown,
-            "priority": priority,
-            "inquiry_id": inquiry_id,
-        }
-        if suggestion_strings is not None:
-            event["suggestions"] = suggestion_strings
-        if file_paths is not None:
-            event["file_paths"] = file_paths
-        await self._runner._send_event(event)
-
-        # Enter waiting state — StateManager now owns pending_wait.
-        self._runner._sm.enter_waiting_for_inquiry(inquiry_id)
-
-        item = await self._await_feed(expected_request_id=inquiry_id)
-
-        if isinstance(item, InquiryInterruptItem):
-            return self._runner._sm.receive_unexpected(item)
-
-        if isinstance(item, TerminationItem):
-            self._runner._sm.exit_waiting(inquiry_id)
-            self._pending_inquiry_id = None
-            reason = item.event.get("reason", "Inquiry failed")
-            raise RuntimeError(f"Inquiry failed: {reason}")
-
-        # ResponseItem — extract the InquiryResponse.
-        self._runner._sm.exit_waiting(inquiry_id)
-        self._pending_inquiry_id = None
-
-        resp_event = item.event
-        response = InquiryResponse(
-            text=resp_event.get("response_text"),
-            suggestion_index=resp_event.get("response_suggestion_index"),
-        )
-
-        await self.activity(
-            "inquiry.response",
-            data={
-                "inquiry_id": inquiry_id,
-                "response_text": response.text,
-                "suggestion_index": response.suggestion_index,
-            },
-        )
-
-        return response
-
-    async def talk_to(
-        self,
-        target_agent: str,
-        text: str,
-        *,
-        continue_conversation: bool = False,
-    ) -> str:
-        """Talk to another agent. Blocks until they respond or an interrupt arrives.
-
-        Returns the target agent's response text, or an interrupt message string
-        if an inquiry interrupts the wait.
-        """
-        from ..dispatcher import ResponseItem, InquiryInterruptItem, TerminationItem
-
-        request_id = _uuid7_hex()
-
-        # Emit talk_to.request activity before sending.
-        await self.activity(
-            "talk_to.request",
-            data={
-                "request_id": request_id,
-                "target_agent": target_agent,
-                "text": text,
-                "continue_conversation": continue_conversation,
-            },
-        )
-
-        # Get conversation_id for continuation.
-        conversation_id = None
-        if continue_conversation:
-            conversation_id = self._peer_conversations.get(target_agent)
-
-        # Send request.
-        talk_event: dict = {
-            "type": "agent.event.talk_to.request",
-            "target_agent": target_agent,
-            "text": text,
-            "request_id": request_id,
-            "continue_conversation": continue_conversation,
-        }
-        if conversation_id is not None:
-            talk_event["conversation_id"] = conversation_id
-        await self._runner._send_event(talk_event)
-
-        # Enter waiting state — StateManager now owns pending_wait.
-        self._runner._sm.enter_waiting_for_agent(request_id, target_agent)
-
-        # Chain liveness tracking.
-        chain_dead = asyncio.Event()
-        self._talk_to_chain_dead[request_id] = chain_dead
-        loop = asyncio.get_running_loop()
-        self._request_alive_timestamps[request_id] = loop.time()
-        watchdog = asyncio.create_task(self._chain_watchdog(request_id))
-
-        try:
-            item = await self._await_feed(
-                expected_request_id=request_id,
-                cancel_event=chain_dead,
+        response = await self._channel.stub.Inquire(
+            dspatch_router_pb2.InquireRpcRequest(
+                instance_id=self._instance_id,
+                content_markdown=content_markdown,
+                suggestions=suggestion_strings or [],
+                file_paths=file_paths or [],
+                priority=priority,
             )
-        finally:
-            watchdog.cancel()
-            try:
-                await watchdog
-            except asyncio.CancelledError:
-                pass
-            self._talk_to_chain_dead.pop(request_id, None)
-            self._request_alive_timestamps.pop(request_id, None)
-
-        if isinstance(item, InquiryInterruptItem):
-            # StateManager preserves pending_wait and transitions to generating.
-            return self._runner._sm.receive_unexpected(item)
-
-        if isinstance(item, TerminationItem):
-            self._runner._sm.exit_waiting(request_id)
-            reason = item.event.get("reason", "")
-            detail = reason if reason else "The target agent is no longer alive."
-            raise RuntimeError(
-                f'talk_to("{target_agent}") failed: {detail}'
-            )
-
-        # ResponseItem — success.
-        self._runner._sm.exit_waiting(request_id)
-        response = item.event
-
-        error = response.get("error")
-        if error:
-            raise RuntimeError(f"talk_to failed: {error}")
-
-        conv_id = response.get("conversation_id")
-        if conv_id:
-            self._peer_conversations[target_agent] = conv_id
-
-        response_text = response.get("response", "")
-
-        await self.activity(
-            "talk_to.response",
-            data={
-                "request_id": request_id,
-                "target_agent": target_agent,
-                "response": response_text,
-            },
         )
 
-        return response_text
-
-    # ── Feed loop (shared blocking primitive) ──────────────────────────────
-
-    async def _await_feed(
-        self,
-        expected_request_id: str | None = None,
-        cancel_event: asyncio.Event | None = None,
-    ) -> FeedItem:
-        """Consume from router feed until we get the expected response or interrupt.
-
-        Callers MUST call sm.enter_waiting_for_agent/inquiry() before this.
-        If *cancel_event* is set while waiting, raises ``RuntimeError``.
-        Returns the FeedItem that resolved the wait.
-        """
-        from ..dispatcher import ResponseItem, TerminationItem
-
-        router = self._runner._router
         while True:
-            # Race the feed against an optional cancel signal (chain watchdog).
-            feed_task = asyncio.ensure_future(router.feed.get())
-            try:
-                if cancel_event is not None:
-                    cancel_task = asyncio.ensure_future(cancel_event.wait())
-                    done, pending = await asyncio.wait(
-                        {feed_task, cancel_task},
-                        return_when=asyncio.FIRST_COMPLETED,
+            which = response.WhichOneof("result")
+
+            if which == "success":
+                if response.success.response_text:
+                    return response.success.response_text
+                return InquiryResponse(
+                    text=response.success.response_text,
+                    suggestion_index=response.success.suggestion_index if response.success.suggestion_index != 0 else None,
+                )
+
+            elif which == "error":
+                raise RuntimeError(response.error.reason)
+
+            elif which == "interrupt":
+                reply = await self._handle_inquiry_interrupt(response.interrupt)
+                response = await self._channel.stub.ResumeInquire(
+                    dspatch_router_pb2.ResumeInquireRequest(
+                        instance_id=self._instance_id,
+                        inquiry_id=response.interrupt.inquiry_id,
+                        inquiry_response_text=reply,
                     )
-                    for p in pending:
-                        p.cancel()
-                    if cancel_task in done:
-                        raise RuntimeError(
-                            "Chain alive timeout — the conversation chain "
-                            "appears to be dead."
-                        )
-                    item = feed_task.result()
-                else:
-                    item = await feed_task
-            except asyncio.CancelledError:
-                feed_task.cancel()
-                raise
+                )
 
-            if isinstance(item, ResponseItem):
-                if expected_request_id:
-                    # Match by request_id (talk_to) or inquiry_id (inquire).
-                    item_id = item.event.get("request_id") or item.event.get("inquiry_id")
-                    if item_id != expected_request_id:
-                        router._buffer_insert(item)
-                        continue
-                return item
+    # ── Interrupt handling ───────────────────────────────────────────────
 
-            if isinstance(item, InquiryInterruptItem):
-                return item
+    async def _handle_inquiry_interrupt(
+        self, interrupt: dspatch_router_pb2.InquiryInterrupt,
+    ) -> str:
+        """Handle an inquiry interrupt inline — run the agent's handler and return the reply text.
 
-            if isinstance(item, TerminationItem):
-                return item
-
-    # ── Internal (called by runner) ───────────────────────────────────────
-
-    def _record_request_alive(self, request_id: str) -> None:
-        """Record a request_alive heartbeat for a pending talk_to request."""
-        if request_id in self._talk_to_chain_dead:
-            self._request_alive_timestamps[request_id] = (
-                asyncio.get_running_loop().time()
-            )
-
-    async def _chain_watchdog(self, request_id: str) -> None:
-        """Background task: signal chain death if heartbeats stop arriving."""
-        try:
-            while True:
-                await asyncio.sleep(_CHAIN_WATCHDOG_CHECK)
-                last = self._request_alive_timestamps.get(request_id)
-                if last is None:
-                    return  # Request completed, no longer tracking.
-                elapsed = asyncio.get_running_loop().time() - last
-                if elapsed > _CHAIN_ALIVE_TIMEOUT:
-                    logger.warning(
-                        "Chain alive timeout for request %s "
-                        "(%.0fs without heartbeat)",
-                        request_id, elapsed,
-                    )
-                    dead = self._talk_to_chain_dead.get(request_id)
-                    if dead is not None:
-                        dead.set()
-                    return
-        except asyncio.CancelledError:
-            pass
-
+        For now, auto-responds with a placeholder. In the future, this could invoke the agent's
+        inquiry handling logic.
+        """
+        # TODO: Implement proper interrupt handling (let LLM decide response)
+        return f"[Auto-reply to inquiry from {interrupt.from_agent}]: Acknowledged."

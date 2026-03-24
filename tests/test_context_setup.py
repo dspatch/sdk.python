@@ -4,31 +4,27 @@
 import asyncio
 import base64
 import os
+from unittest.mock import MagicMock, AsyncMock
 import pytest
 from dspatch.contexts import Context
+from dspatch.generated import dspatch_router_pb2
 
 
-class FakeHost:
-    def __init__(self):
-        self.sent = []
-
-    async def send_event(self, event):
-        self.sent.append(event)
-
-
-class FakeRunner:
-    _current_turn_id = "turn_1"
-
-    async def _send_event(self, event):
-        pass
-
-    async def _send_message(self, content, **kwargs):
-        return "msg_1"
+def _make_ctx():
+    """Create a Context with a mock GrpcChannel for testing."""
+    channel = MagicMock()
+    channel.agent_key = "test"
+    channel.instance_id = "test-0"
+    channel.stub = MagicMock()
+    channel.stub.SendOutput = AsyncMock(
+        return_value=dspatch_router_pb2.Ack(ok=True)
+    )
+    return Context(channel=channel, instance_id="test-0", turn_id="turn-1", messages=[])
 
 
 class TestContextStubs:
     def test_setup_stores_values(self):
-        ctx = Context(host=FakeHost(), runner=FakeRunner())
+        ctx = _make_ctx()
         ctx.setup(system_prompt="hello", authority="full", options={"model": "x"})
         assert ctx._user_system_prompt == "hello"
         assert ctx._user_authority == "full"
@@ -36,27 +32,27 @@ class TestContextStubs:
 
     @pytest.mark.asyncio
     async def test_run_raises_not_implemented(self):
-        ctx = Context(host=FakeHost(), runner=FakeRunner())
+        ctx = _make_ctx()
         with pytest.raises(NotImplementedError):
             await ctx.run("hello")
 
     @pytest.mark.asyncio
     async def test_context_manager_without_setup_raises(self):
-        ctx = Context(host=FakeHost(), runner=FakeRunner())
+        ctx = _make_ctx()
         with pytest.raises(RuntimeError, match="setup.*before"):
             async with ctx:
                 pass
 
     def test_existing_methods_still_work(self):
         """Existing platform methods are unaffected by new stubs."""
-        ctx = Context(host=FakeHost(), runner=FakeRunner())
+        ctx = _make_ctx()
         # log() should not raise
         ctx.log("test message")
 
 
 class TestFieldFallback:
     def test_read_field_decodes_base64(self):
-        ctx = Context(host=FakeHost(), runner=FakeRunner())
+        ctx = _make_ctx()
         os.environ["DSPATCH_FIELD_SYSTEM_PROMPT"] = base64.b64encode(b"Hello world").decode()
         try:
             assert ctx._read_field("system_prompt") == "Hello world"
@@ -64,12 +60,12 @@ class TestFieldFallback:
             del os.environ["DSPATCH_FIELD_SYSTEM_PROMPT"]
 
     def test_read_field_returns_none_when_missing(self):
-        ctx = Context(host=FakeHost(), runner=FakeRunner())
+        ctx = _make_ctx()
         os.environ.pop("DSPATCH_FIELD_NONEXISTENT", None)
         assert ctx._read_field("nonexistent") is None
 
     def test_setup_falls_back_to_env_system_prompt(self):
-        ctx = Context(host=FakeHost(), runner=FakeRunner())
+        ctx = _make_ctx()
         os.environ["DSPATCH_FIELD_SYSTEM_PROMPT"] = base64.b64encode(b"From env").decode()
         try:
             ctx.setup()
@@ -78,7 +74,7 @@ class TestFieldFallback:
             del os.environ["DSPATCH_FIELD_SYSTEM_PROMPT"]
 
     def test_setup_falls_back_to_env_authority(self):
-        ctx = Context(host=FakeHost(), runner=FakeRunner())
+        ctx = _make_ctx()
         os.environ["DSPATCH_FIELD_AUTHORITY"] = base64.b64encode(b"May fix bugs").decode()
         try:
             ctx.setup()
@@ -87,7 +83,7 @@ class TestFieldFallback:
             del os.environ["DSPATCH_FIELD_AUTHORITY"]
 
     def test_setup_explicit_overrides_env(self):
-        ctx = Context(host=FakeHost(), runner=FakeRunner())
+        ctx = _make_ctx()
         os.environ["DSPATCH_FIELD_SYSTEM_PROMPT"] = base64.b64encode(b"From env").decode()
         os.environ["DSPATCH_FIELD_AUTHORITY"] = base64.b64encode(b"From env auth").decode()
         try:
@@ -99,7 +95,7 @@ class TestFieldFallback:
             del os.environ["DSPATCH_FIELD_AUTHORITY"]
 
     def test_setup_empty_string_falls_through(self):
-        ctx = Context(host=FakeHost(), runner=FakeRunner())
+        ctx = _make_ctx()
         os.environ["DSPATCH_FIELD_SYSTEM_PROMPT"] = base64.b64encode(b"Fallback").decode()
         try:
             ctx.setup(system_prompt="")
@@ -108,7 +104,7 @@ class TestFieldFallback:
             del os.environ["DSPATCH_FIELD_SYSTEM_PROMPT"]
 
     def test_read_field_handles_invalid_base64(self):
-        ctx = Context(host=FakeHost(), runner=FakeRunner())
+        ctx = _make_ctx()
         os.environ["DSPATCH_FIELD_BAD"] = "not-valid-base64!!!"
         try:
             assert ctx._read_field("bad") is None
@@ -116,7 +112,7 @@ class TestFieldFallback:
             del os.environ["DSPATCH_FIELD_BAD"]
 
     def test_read_field_handles_unicode(self):
-        ctx = Context(host=FakeHost(), runner=FakeRunner())
+        ctx = _make_ctx()
         text = "You are a 日本語 assistant 🤖"
         os.environ["DSPATCH_FIELD_TEST"] = base64.b64encode(text.encode("utf-8")).decode()
         try:
