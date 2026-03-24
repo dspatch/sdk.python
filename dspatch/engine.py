@@ -1,104 +1,102 @@
 # Copyright (c) 2026 Osman Alperen Çinar-Koraş (oakisnotree). Licensed under AGPL-3.0.
-"""DspatchEngine — top-level API for agent developers."""
+"""DspatchEngine — entry point for building dspatch agents.
+
+v2: Uses gRPC channel to local dspatch-router instead of WebSocket to engine.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+import sys
 from collections.abc import Callable
+from typing import Any
 
-from .contexts import Context
+from .contexts.context import Context
+from .grpc_channel import GrpcChannel
+
+logger = logging.getLogger("dspatch.engine")
 
 
 class DspatchEngine:
-    """Entry point for building a dspatch agent.
-
-    Usage::
-
-        from dspatch import DspatchEngine, ClaudeAgentContext
-
-        dspatch = DspatchEngine()
-
-        @dspatch.agent(ClaudeAgentContext)
-        async def handle(prompt: str, ctx: ClaudeAgentContext):
-            ctx.setup(system_prompt="You are helpful.")
-            async with ctx:
-                while True:
-                    await ctx.run(prompt)
-                    prompt = yield
-                    if prompt is None:
-                        break
-
-        dspatch.run()
-    """
+    """Top-level API for building a dspatch agent."""
 
     def __init__(self) -> None:
         self._agent_fn: Callable | None = None
         self._context_class: type[Context] = Context
         self._resume_fn: Callable | None = None
 
-    def agent(self, context_class: type[Context]) -> Callable[[Callable], Callable]:
-        """Decorator — register the agent handler function.
-
-        Args:
-            context_class: The context type to inject into the handler
-                (e.g. ``ClaudeAgentContext``, ``OpenAiAgentContext``).
-
-        Example::
-
-            @dspatch.agent(ClaudeAgentContext)
-            async def my_agent(prompt: str, ctx: ClaudeAgentContext):
-                ...
-        """
-        self._context_class = context_class
-
+    def agent(
+        self, context_class: type[Context] | None = None
+    ) -> Callable:
+        """Decorator to register the agent handler function."""
         def decorator(fn: Callable) -> Callable:
             self._agent_fn = fn
+            if context_class is not None:
+                self._context_class = context_class
             return fn
-
         return decorator
 
     def on_resume(self, fn: Callable) -> Callable:
-        """Decorator — register an optional resume handler."""
+        """Decorator to register an optional resume handler."""
         self._resume_fn = fn
         return fn
 
     def run(self) -> None:
-        """Start the agent host loop (blocking)."""
+        """Blocking entry point. Connects to router, registers, starts worker."""
+        self._configure_logging()
+
         if self._agent_fn is None:
-            raise RuntimeError(
-                "No agent function registered. "
-                "Use the @dspatch.agent(ContextClass) decorator."
-            )
+            raise RuntimeError("No agent function registered. Use @engine.agent()")
 
-        import logging
-        import os
-        import sys
+        asyncio.run(self._async_run())
 
-        # Configure logging early so all dspatch.* loggers produce output.
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(name)s %(levelname)s %(message)s",
-            stream=sys.stderr,
-        )
-        # Allow DEBUG records from the dspatch namespace so they can be
-        # captured by the _DspatchLogHandler and forwarded over the wire.
-        logging.getLogger("dspatch").setLevel(logging.DEBUG)
+    async def _async_run(self) -> None:
+        from .agent_worker import AgentWorker
+        from .generated import dspatch_router_pb2
 
-        agent_key = os.environ.get("DSPATCH_AGENT_KEY", "?")
-        print(f"[dspatch-sdk] DspatchEngine.run() starting for {agent_key}",
-              flush=True)
+        channel = GrpcChannel()
+        await channel.connect()
 
-        from .client import WsClient
-        from .host import AgentHostRouter
-
-        client = WsClient()
         try:
-            asyncio.run(
-                AgentHostRouter(
-                    self._agent_fn, client,
-                    context_class=self._context_class,
-                ).start()
+            # Register with router
+            resp = await channel.stub.Register(
+                dspatch_router_pb2.RegisterRequest(
+                    name=channel.agent_key,
+                    role="host",
+                    capabilities=[],
+                )
             )
-        except (KeyboardInterrupt, SystemExit):
-            # Expected during container shutdown (SIGTERM/SIGINT from Docker).
-            pass
+            if not resp.ok:
+                logger.error("Registration failed")
+                return
+
+            logger.info(
+                "Registered as %s (instance %s), router v%s",
+                channel.agent_key,
+                channel.instance_id,
+                resp.router_version,
+            )
+
+            # Start worker
+            worker = AgentWorker(
+                agent_fn=self._agent_fn,
+                channel=channel,
+                context_class=self._context_class,
+            )
+            await worker.run()
+
+        finally:
+            await channel.disconnect()
+
+    def _configure_logging(self) -> None:
+        """Set up dspatch.* logging."""
+        root = logging.getLogger("dspatch")
+        if not root.handlers:
+            handler = logging.StreamHandler(sys.stderr)
+            handler.setFormatter(
+                logging.Formatter("[%(name)s] %(levelname)s: %(message)s")
+            )
+            root.addHandler(handler)
+            root.setLevel(logging.DEBUG if os.environ.get("DSPATCH_DEBUG") else logging.INFO)
