@@ -1,329 +1,183 @@
 # Copyright (c) 2026 Osman Alperen Çinar-Koraş (oakisnotree). Licensed under AGPL-3.0.
-"""AgentWorker — consumes from AgentInstanceRouter feed, runs agent function."""
+"""AgentWorker — consumes gRPC EventStream, runs agent function, signals CompleteTurn.
+
+v2: No state machine, no turn ID management, no buffer. The router handles all of that.
+Main loop: receive event -> create context -> run agent -> CompleteTurn.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
 import logging
-import time
-import traceback
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-from .dispatcher import InputItem, InquiryInterruptItem
-from .instance_router import AgentInstanceRouter
+from .generated import dspatch_router_pb2
 from .models import Message
-from .state_manager import StateManager
+
+if TYPE_CHECKING:
+    from .contexts.context import Context
+    from .grpc_channel import GrpcChannel
 
 logger = logging.getLogger("dspatch.worker")
 
 
-def _task_done_callback(task: asyncio.Task) -> None:
-    """Log any unhandled exception from a fire-and-forget task."""
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc:
-        logger.error(
-            "Background task %s failed: %s", task.get_name(), exc, exc_info=exc,
-        )
-
-
-def _with_sender_header(content: str, sender: str) -> str:
-    """Prepend a sender header to prompt content."""
-    return f"{{{{SENDER: {sender}}}}}\n{content}"
-
-
 class AgentWorker:
-    """Consumes items from the AgentInstanceRouter feed and runs the agent.
-
-    Does not own state — uses StateManager to enter/exit states.
-    Handles:
-    - user_input → run agent, send result
-    - talk_to_request → run agent, send talk_to_response
-    - inquiry_request (when idle) → inject as input, run agent
-    """
+    """Consumes events from the router's gRPC EventStream and runs the agent function."""
 
     def __init__(
         self,
-        *,
         agent_fn: Callable,
-        agent_name: str,
-        instance_id: str,
-        router: AgentInstanceRouter,
-        state_manager: StateManager,
-        host: object,
-        context_class=None,
-        history: list[dict] | None = None,
+        channel: GrpcChannel,
+        context_class: type[Context],
     ) -> None:
-        from .contexts import Context
         self._agent_fn = agent_fn
-        self._agent_name = agent_name
-        self._instance_id = instance_id
-        self._router = router
-        self._sm = state_manager
-        self._host = host
-        self._context_class = context_class or Context
-        self._is_generator = inspect.isasyncgenfunction(agent_fn)
-        self._gen: AsyncGenerator | None = None
+        self._channel = channel
+        self._context_class = context_class
         self._running = True
-        self._ctx = None
-        self._current_turn_id: str | None = None
-        self._interrupted = False
-        self._history: list[dict] = history or []
+        self._is_generator = inspect.isasyncgenfunction(agent_fn)
+        self._gen = None
 
-    # ── Main loop ────────────────────────────────────────────────────────
+    def stop(self) -> None:
+        self._running = False
 
     async def run(self) -> None:
-        """Main worker loop — pops from feed, runs agent, repeats."""
-        # Build initial messages from history (session resume).
-        initial_messages = self._parse_history(self._history)
-
-        self._ctx = self._context_class(
-            host=self._host,
-            runner=self,  # AgentWorker acts as the runner interface for Context
-            instance_id=self._instance_id,
-            messages=initial_messages,
+        """Main worker loop: receive events from router, run agent, complete turn."""
+        req = dspatch_router_pb2.EventStreamRequest(
+            name=self._channel.agent_key,
+            instance_id=self._channel.instance_id,
         )
-        if initial_messages:
-            logger.info(
-                "AgentWorker %s replayed %d history messages into context",
-                self._instance_id, len(initial_messages),
-            )
-        logger.info("AgentWorker %s ready", self._instance_id)
-        try:
-            while self._running:
-                try:
-                    item = await self._router.feed.get()
-                except asyncio.CancelledError:
-                    raise
-                await self._run_one_item(item)
-        finally:
+
+        logger.info("Starting event stream for %s", self._channel.instance_id)
+
+        async for event in self._channel.stub.EventStream(req):
+            if not self._running:
+                break
+
+            try:
+                await self._handle_event(event)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Error handling event for %s", self._channel.instance_id)
+
+    async def _handle_event(self, event: dspatch_router_pb2.RouterEvent) -> None:
+        """Dispatch a single RouterEvent."""
+        which = event.WhichOneof("event")
+
+        if which == "user_input":
+            await self._handle_user_input(event)
+        elif which == "talk_to_request":
+            await self._handle_talk_to_request(event)
+        elif which == "inquiry_request":
+            await self._handle_inquiry_request(event)
+        elif which == "drain":
+            logger.info("Drain signal received, stopping")
+            self.stop()
+        elif which == "terminate":
+            logger.info("Terminate signal received, stopping")
+            self.stop()
+        elif which == "interrupt":
+            logger.info("Interrupt signal received")
             await self._close_gen()
 
-    async def _run_one(self) -> None:
-        """Process exactly one item from the feed (for testing)."""
-        if self._ctx is None:
-            from .contexts import Context
-            self._ctx = self._context_class(
-                host=self._host, runner=self, instance_id=self._instance_id,
-            )
-        item = await self._router.feed.get()
-        await self._run_one_item(item)
+    async def _handle_user_input(self, event: dspatch_router_pb2.RouterEvent) -> None:
+        """Handle user_input: create context, run agent, complete turn."""
+        ui = event.user_input
+        text = ui.text
 
-    async def _run_one_item(self, item) -> None:
-        """Dispatch a single feed item."""
-        if item is None:
-            return  # Sentinel for testing
+        # Parse history
+        messages = [
+            Message(id=m.id, role=m.role, content=m.content)
+            for m in ui.history
+        ]
 
-        try:
-            self._sm.enter_generating()
-            turn_id = self._router.push_turn()
-            self._current_turn_id = turn_id
-
-            if isinstance(item, InquiryInterruptItem):
-                await self._handle_idle_inquiry(item)
-            elif isinstance(item, InputItem):
-                await self._handle_input(item)
-
-            self._router.pop_turn()
-            self._sm.enter_idle()
-
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.error("AgentWorker error:\n%s", traceback.format_exc())
-            try:
-                self._router.pop_turn()
-                self._sm.enter_idle()
-            except Exception:
-                logger.debug("State cleanup error after worker exception", exc_info=True)
-
-    async def _handle_input(self, item: InputItem) -> None:
-        event = item.event
-        event_type = event.get("type", "")
-
-        if event_type == "agent.event.user_input":
-            content = event.get("content", "")
-            if not content:
-                return
-            await self._ctx.prompt(content)
-            self._ctx._message_sent = False
-            result = await self._run_agent(_with_sender_header(content, "user"), self._ctx)
-            if result and not self._ctx._message_sent:
-                await self._send_message(result)
-
-        elif event_type == "agent.event.talk_to.request":
-            text = event.get("text", "")
-            request_id = event.get("request_id", "")
-            caller = event.get("caller_agent", "") or "unknown"
-
-            # Emit a dedicated talk_to.receive activity.
-            # TODO: Comment this in again, after refactoring how prompt_recevied is visualized
-            # await self._ctx.activity(
-            #     "talk_to.receive",
-            #     data={
-            #         "request_id": request_id,
-            #         "caller_agent": caller,
-            #         "text": text,
-            #     },
-            # )
-
-            await self._ctx.prompt(text, sender_name=caller)
-            self._ctx._message_sent = False
-            result = await self._run_agent(_with_sender_header(text, caller), self._ctx)
-            await self._send_talk_to_response(request_id=request_id, response=result or "")
-
-        else:
-            logger.warning("AgentWorker: unhandled input event type %r", event_type)
-
-    async def _handle_idle_inquiry(self, item: InquiryInterruptItem) -> None:
-        """Handle an inquiry that arrived while idle (new input)."""
-        from .tools.inquiry_interrupt import format_inquiry_injection
-        event = item.event
-        inquiry_id = event.get("inquiry_id", "")
-        from_agent = event.get("from_agent", "unknown")
-        injection = format_inquiry_injection(
-            from_agent=from_agent,
-            content=event.get("content_markdown", ""),
-            suggestions=[
-                s.get("text", "") if isinstance(s, dict) else str(s)
-                for s in event.get("suggestions", [])
-            ] or None,
+        # Create context
+        ctx = self._context_class(
+            channel=self._channel,
+            instance_id=event.instance_id,
+            turn_id=event.turn_id,
+            messages=messages,
         )
-        self._ctx._pending_inquiry_id = inquiry_id
-        await self._ctx.prompt(injection, sender_name=from_agent)
-        self._ctx._message_sent = False
-        result = await self._run_agent(_with_sender_header(injection, from_agent), self._ctx)
-        if result and not self._ctx._message_sent:
-            await self._send_message(result)
-        self._ctx._pending_inquiry_id = None
 
-    # ── History replay ─────────────────────────────────────────────────
+        # Send prompt_received
+        await ctx.prompt(text)
 
-    @staticmethod
-    def _parse_history(history: list[dict]) -> list[Message]:
-        """Convert raw history dicts into Message objects.
+        # Run agent
+        result = await self._run_agent(text, ctx)
 
-        Each dict is expected to carry ``id``, ``role``, and ``content``.
-        Malformed entries are skipped with a warning.  The resulting list
-        seeds ``Context.messages`` so the agent has full conversation
-        context before processing new input.  Because every Message
-        retains its original UUID7 ``id``, any output the agent produces
-        with the same id will be an upsert — no duplicates.
-        """
-        messages: list[Message] = []
-        for entry in history:
-            msg_id = entry.get("id", "")
-            role = entry.get("role", "")
-            content = entry.get("content", "")
-            if not msg_id or not role:
-                logger.warning("Skipping malformed history entry: %s", entry)
-                continue
-            messages.append(Message(id=msg_id, role=role, content=content))
-        return messages
+        # Complete turn
+        await self._channel.stub.CompleteTurn(
+            dspatch_router_pb2.CompleteTurnRequest(
+                instance_id=event.instance_id,
+                turn_id=event.turn_id,
+                result=result,
+            )
+        )
 
-    # ── Agent execution ──────────────────────────────────────────────────
+    async def _handle_talk_to_request(self, event: dspatch_router_pb2.RouterEvent) -> None:
+        """Handle talk_to_request: run agent, complete turn with response."""
+        req = event.talk_to_request
 
-    async def _run_agent(self, text, ctx):
+        ctx = self._context_class(
+            channel=self._channel,
+            instance_id=event.instance_id,
+            turn_id=event.turn_id,
+            messages=[],
+        )
+
+        await ctx.prompt(req.text, sender_name=req.caller_agent)
+        result = await self._run_agent(req.text, ctx)
+
+        await self._channel.stub.CompleteTurn(
+            dspatch_router_pb2.CompleteTurnRequest(
+                instance_id=event.instance_id,
+                turn_id=event.turn_id,
+                result=result or "",
+            )
+        )
+
+    async def _handle_inquiry_request(self, event: dspatch_router_pb2.RouterEvent) -> None:
+        """Handle inquiry_request when idle (as a new input)."""
+        inq = event.inquiry_request
+        text = f"[Inquiry from {inq.from_agent}]: {inq.content_markdown}"
+
+        ctx = self._context_class(
+            channel=self._channel,
+            instance_id=event.instance_id,
+            turn_id=event.turn_id,
+            messages=[],
+        )
+
+        await self._run_agent(text, ctx)
+
+        await self._channel.stub.CompleteTurn(
+            dspatch_router_pb2.CompleteTurnRequest(
+                instance_id=event.instance_id,
+                turn_id=event.turn_id,
+            )
+        )
+
+    async def _run_agent(self, text: str, ctx) -> str | None:
+        """Run the agent function (oneshot or generator)."""
         if self._is_generator:
             return await self._run_generator(text, ctx)
         return await self._run_oneshot(text, ctx)
 
-    async def _run_oneshot(self, text, ctx):
-        try:
-            result = self._agent_fn(text, ctx)
-            if asyncio.iscoroutine(result):
-                result = await result
-            return result if isinstance(result, str) else None
-        except Exception:
-            logger.error("Agent error:\n%s", traceback.format_exc())
-            ctx.log(traceback.format_exc(), level="error")
-            return f"Error: {traceback.format_exc()[:300]}"
+    async def _run_oneshot(self, text: str, ctx) -> str | None:
+        result = await self._agent_fn(text, ctx)
+        return str(result) if result is not None else None
 
-    async def _run_generator(self, text, ctx):
-        try:
-            if self._gen is None:
-                self._gen = self._agent_fn(text, ctx)
-                result = await self._gen.asend(None)
-            else:
-                result = await self._gen.asend(text)
-            return result if isinstance(result, str) else None
-        except StopAsyncIteration:
+    async def _run_generator(self, text: str, ctx) -> str | None:
+        if self._gen is None:
+            self._gen = self._agent_fn(text, ctx)
+            result = await self._gen.__anext__()
+        else:
+            result = await self._gen.asend(text)
+        return str(result) if result is not None else None
+
+    async def _close_gen(self) -> None:
+        if self._gen is not None:
+            await self._gen.aclose()
             self._gen = None
-            return None
-        except Exception:
-            logger.error("Agent error:\n%s", traceback.format_exc())
-            ctx.log(traceback.format_exc(), level="error")
-            self._gen = None
-            return f"Error: {traceback.format_exc()[:300]}"
-
-    async def _close_gen(self):
-        gen, self._gen = self._gen, None
-        if gen is not None:
-            try:
-                await gen.aclose()
-            except Exception:
-                logger.debug("Generator close error", exc_info=True)
-
-    # ── Send helpers (Context uses these via runner interface) ───────────
-
-    async def _send_event(self, event: dict) -> None:
-        tagged = self._router.tag_outbound({
-            **event,
-            "instance_id": self._instance_id,
-            "ts": int(time.time() * 1000),
-        })
-        await self._host.send_event(tagged)
-
-    async def _send_message(self, content: str, **kwargs) -> str:
-        from .contexts.context import _uuid7_hex
-        msg_id = kwargs.pop("message_id", None) or _uuid7_hex()
-        await self._send_event({
-            "type": "agent.output.message",
-            "id": msg_id,
-            "role": kwargs.pop("role", "assistant"),
-            "content": content,
-            "is_delta": kwargs.pop("is_delta", False),
-            **kwargs,
-        })
-        return msg_id
-
-    async def _send_activity(
-        self,
-        event_type: str,
-        *,
-        content: str | None = None,
-        is_delta: bool = False,
-        activity_id: str | None = None,
-        data: dict | None = None,
-    ) -> str:
-        from .contexts.context import _uuid7_hex
-        aid = activity_id or _uuid7_hex()
-        event: dict = {
-            "type": "agent.output.activity",
-            "id": aid,
-            "event_type": event_type,
-            "is_delta": is_delta,
-        }
-        if content is not None:
-            event["content"] = content
-        if data is not None:
-            event["data"] = data
-        await self._send_event(event)
-        return aid
-
-    async def _send_prompt_received(self, content: str, *, sender_name=None) -> None:
-        await self._send_event({
-            "type": "agent.output.prompt_received",
-            "content": content,
-            "sender_name": sender_name,
-        })
-
-    async def _send_talk_to_response(self, request_id: str, response: str) -> None:
-        await self._send_event({
-            "type": "agent.event.talk_to.response",
-            "request_id": request_id,
-            "response": response,
-            "conversation_id": self._instance_id,
-        })
