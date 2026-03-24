@@ -285,12 +285,6 @@ class Context:
             "coordinate work — delegate subtasks, request reviews, or share "
             "context. Each tool sends a message and waits for the other "
             "agent's response."
-            "\n\n"
-            "**Interruptions:** While waiting for an agent's response, you may "
-            "receive an inquiry interruption. If a tool returns an INTERRUPTED "
-            "message, immediately call receive_incoming_inquiry, handle the "
-            "inquiry with reply_to_inquiry, then call "
-            "continue_waiting_for_agent_response to resume."
         )
 
     # ── Tool specs & dispatch ────────────────────────────────────────────
@@ -302,29 +296,15 @@ class Context:
         **and** an async ``handler(args)`` callable.  Subclasses iterate this
         list and wrap each entry into their provider-specific format.
         """
-        from ..tools import agents, inquiry, inquiry_interrupt, receive_inquiry, continue_waiting
+        from ..tools import agents, inquiry
 
         ctx = self  # capture for closures
 
         async def _inquiry_handler(args: dict[str, Any]) -> dict[str, Any]:
             return await inquiry.execute(ctx, args)
 
-        async def _reply_handler(args: dict[str, Any]) -> dict[str, Any]:
-            return await inquiry_interrupt.execute_reply(
-                ctx, args, ctx._pending_inquiry_id,
-            )
-
-        async def _receive_handler(_args: dict[str, Any]) -> dict[str, Any]:
-            return await receive_inquiry.execute(ctx)
-
-        async def _continue_handler(_args: dict[str, Any]) -> dict[str, Any]:
-            return await continue_waiting.execute(ctx)
-
         specs: list[ToolSpec] = [
             ToolSpec(inquiry.NAME, inquiry.DESCRIPTION, inquiry.SCHEMA, _inquiry_handler),
-            ToolSpec(inquiry_interrupt.REPLY_NAME, inquiry_interrupt.REPLY_DESCRIPTION, inquiry_interrupt.REPLY_SCHEMA, _reply_handler),
-            ToolSpec(receive_inquiry.NAME, receive_inquiry.DESCRIPTION, receive_inquiry.SCHEMA, _receive_handler),
-            ToolSpec(continue_waiting.NAME, continue_waiting.DESCRIPTION, continue_waiting.SCHEMA, _continue_handler),
         ]
 
         if self.available_agents:
