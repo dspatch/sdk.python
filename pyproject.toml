@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dspatch-sdk"
-version = "0.1.2"
+version = "0.1.3"
 description = "Python SDK for d:spatch agent-to-host communication"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -38,7 +38,7 @@ Issues = "https://github.com/dspatch/dspatch-sdk/issues"
 include = ["dspatch*"]
 
 [tool.bumpversion]
-current_version = "0.1.2"
+current_version = "0.1.3"
 commit = true
 tag = true
 tag_name = "v{new_version}"

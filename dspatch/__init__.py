@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Osman Alperen Çinar-Koraş (oakisnotree). Licensed under AGPL-3.0.
 """dspatch SDK — Python agent-to-host communication."""
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 from .contexts import ClaudeAgentContext, Context, OpenAiAgentContext
 from .engine import DspatchEngine
