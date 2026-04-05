@@ -28,7 +28,7 @@ if _version_not_supported:
 class DspatchRouterStub(object):
     """══════════════════════════════════════════════════════════════
     DspatchRouter — gRPC API between Agent SDKs and dspatch-router
-    Served on a unix domain socket inside the container: /tmp/dspatch.sock
+    Served on TCP inside the container (default: 127.0.0.1:50051)
     ══════════════════════════════════════════════════════════════
 
     """
@@ -84,7 +84,7 @@ class DspatchRouterStub(object):
 class DspatchRouterServicer(object):
     """══════════════════════════════════════════════════════════════
     DspatchRouter — gRPC API between Agent SDKs and dspatch-router
-    Served on a unix domain socket inside the container: /tmp/dspatch.sock
+    Served on TCP inside the container (default: 127.0.0.1:50051)
     ══════════════════════════════════════════════════════════════
 
     """
@@ -206,7 +206,7 @@ def add_DspatchRouterServicer_to_server(servicer, server):
 class DspatchRouter(object):
     """══════════════════════════════════════════════════════════════
     DspatchRouter — gRPC API between Agent SDKs and dspatch-router
-    Served on a unix domain socket inside the container: /tmp/dspatch.sock
+    Served on TCP inside the container (default: 127.0.0.1:50051)
     ══════════════════════════════════════════════════════════════
 
     """
