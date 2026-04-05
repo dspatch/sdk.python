@@ -95,7 +95,7 @@ These are set by the d:spatch app when spawning agent containers. Agent code rea
 
 | Variable | Purpose |
 |----------|---------|
-| `DSPATCH_GRPC_SOCKET` | Unix socket path for gRPC connection to dspatch-router |
+| `DSPATCH_GRPC_ADDR` | gRPC address for dspatch-router (default: 127.0.0.1:50051) |
 | `DSPATCH_AGENT_KEY` | This agent's key (e.g. "lead", "coder") |
 | `DSPATCH_AGENT_ID` | Full agent identifier for routing |
 | `DSPATCH_AGENT_INSTANCE` | Instance index (for multi-instance agents) |

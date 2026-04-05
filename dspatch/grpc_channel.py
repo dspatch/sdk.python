@@ -25,18 +25,17 @@ class GrpcChannel:
         self._stub: dspatch_router_pb2_grpc.DspatchRouterStub | None = None
 
     def _read_config(self) -> None:
-        self._socket_path = os.environ.get("DSPATCH_GRPC_SOCKET", "/tmp/dspatch.sock")
+        self._grpc_addr = os.environ.get("DSPATCH_GRPC_ADDR", "127.0.0.1:50051")
         self.agent_key = os.environ.get("DSPATCH_AGENT_KEY", "unknown")
         instance_index = os.environ.get("DSPATCH_AGENT_INSTANCE", "0")
         self.instance_id = f"{self.agent_key}-{instance_index}"
         self.workspace_dir = os.environ.get("DSPATCH_WORKSPACE_DIR", "/workspace")
 
     async def connect(self) -> None:
-        """Open gRPC channel to the router's unix domain socket."""
-        target = f"unix://{self._socket_path}"
-        self._channel = grpc.aio.insecure_channel(target)
+        """Open gRPC channel to the router."""
+        self._channel = grpc.aio.insecure_channel(self._grpc_addr)
         self._stub = dspatch_router_pb2_grpc.DspatchRouterStub(self._channel)
-        logger.info("Connected to router at %s", target)
+        logger.info("Connected to router at %s", self._grpc_addr)
 
     async def disconnect(self) -> None:
         """Close gRPC channel."""
